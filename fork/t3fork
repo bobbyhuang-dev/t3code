@@ -1,0 +1,301 @@
+#!/usr/bin/env bash
+# t3fork — keep a personal T3 Code build = latest upstream stable release + your own commits.
+#
+#   t3fork update [--restart]   Rebase `custom` onto the newest upstream release (if any), rebuild when
+#                               `custom` changed, install when T3 Code is not running. Used by launchd.
+#   t3fork build  [--restart]   Rebuild + install the current `custom` branch now (after adding features).
+#   t3fork install [--restart]  Install an already-built (staged) app. --restart quits and reopens T3 Code.
+#   t3fork rebase               Rebase `custom` onto the latest release in your checkout, leaving any
+#                               conflicts for you to resolve (git rerere remembers the resolutions).
+#   t3fork rollback             Put the previously installed app back.
+#   t3fork status               Show release/branch/build state.
+#   t3fork setup                Install this script to ~/.t3fork/bin and load the hourly launchd agent.
+#   t3fork uninstall-agent      Unload the launchd agent.
+set -euo pipefail
+
+REPO="${T3FORK_REPO:-$HOME/Developer/t3code}"
+BRANCH="${T3FORK_BRANCH:-custom}"
+UPSTREAM_REPO="${T3FORK_UPSTREAM:-pingdotgg/t3code}"
+STATE="${T3FORK_STATE:-$HOME/.t3fork}"
+BUILD_DIR="$STATE/build"
+APP_NAME="T3 Code (Beta).app"
+APP_DEST="/Applications/$APP_NAME"
+BUNDLE_ID="com.t3tools.t3code"
+LABEL="com.bobby.t3fork"
+PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
+export PATH="/opt/homebrew/bin:/opt/homebrew/sbin:$HOME/.bun/bin:$HOME/.cargo/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+
+mkdir -p "$STATE/logs" "$STATE/bin"
+
+log() { printf '[%s] %s\n' "$(date '+%F %T')" "$*"; }
+die() { log "ERROR: $*"; notify "T3 fork update failed" "$*"; exit 1; }
+notify() {
+  osascript -e 'on run argv' -e 'display notification (item 2 of argv) with title (item 1 of argv)' \
+    -e 'end run' "$1" "$2" >/dev/null 2>&1 || true
+}
+g() { git -C "$REPO" "$@"; }
+statefile() { cat "$STATE/$1" 2>/dev/null || true; }
+
+acquire_lock() {
+  if ! mkdir "$STATE/lock" 2>/dev/null; then
+    local pid; pid="$(cat "$STATE/lock/pid" 2>/dev/null || true)"
+    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+      log "another t3fork run ($pid) is in progress"; exit 0
+    fi
+    rm -rf "$STATE/lock"; mkdir "$STATE/lock"
+  fi
+  echo $$ >"$STATE/lock/pid"
+  trap 'rm -rf "$STATE/lock"' EXIT
+}
+
+latest_release_tag() {
+  local tag
+  tag="$(gh release view -R "$UPSTREAM_REPO" --json tagName -q .tagName 2>/dev/null || true)"
+  if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    tag="$(g tag -l 'v*' --sort=-v:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -1)"
+  fi
+  [[ -n "$tag" ]] || return 1
+  g rev-parse -q --verify "refs/tags/$tag" >/dev/null || g fetch -q upstream "refs/tags/$tag:refs/tags/$tag"
+  echo "$tag"
+}
+
+# The stable release `custom` currently sits on.
+base_tag() { g describe --tags --abbrev=0 --match 'v[0-9]*' --exclude '*-*' "$BRANCH"; }
+
+fetch_upstream() {
+  log "fetching upstream"
+  g fetch -q upstream --tags --prune
+  # Keep the fork's main a plain mirror of upstream (handy for browsing/diffing on GitHub).
+  g push -q --force origin refs/remotes/upstream/main:refs/heads/main 2>/dev/null || log "warn: could not mirror main to origin"
+}
+
+ensure_build_worktree() {
+  if [[ ! -e "$BUILD_DIR/.git" ]]; then
+    g worktree prune
+    g worktree add -q --detach "$BUILD_DIR" "$BRANCH"
+  fi
+}
+
+# Rebase `custom` onto $1. Returns non-zero on conflict (repository left unchanged).
+rebase_onto() {
+  local new="$1" old cur before
+  old="$(base_tag)"
+  [[ "$old" == "$new" ]] && return 0
+  before="$(g rev-parse "$BRANCH")"
+  log "rebasing $BRANCH: $old -> $new ($(g rev-list --count "$old..$BRANCH") commit(s))"
+  cur="$(g symbolic-ref --short -q HEAD || true)"
+  if [[ "$cur" == "$BRANCH" ]]; then
+    [[ -z "$(g status --porcelain --untracked-files=no)" ]] || {
+      log "$BRANCH is checked out with uncommitted changes; skipping rebase until it is clean"
+      notify "T3 fork" "New T3 Code $new is out. Commit or stash your changes on '$BRANCH' so it can be rebased."
+      return 2
+    }
+    if ! g rebase -q --onto "$new" "$old" "$BRANCH"; then
+      g rebase --abort || true
+      return 1
+    fi
+  else
+    ensure_build_worktree
+    git -C "$BUILD_DIR" checkout -q -f --detach "$BRANCH"
+    if ! git -C "$BUILD_DIR" rebase -q --onto "$new" "$old"; then
+      git -C "$BUILD_DIR" rebase --abort || true
+      return 1
+    fi
+    g update-ref "refs/heads/$BRANCH" "$(git -C "$BUILD_DIR" rev-parse HEAD)" "$before"
+  fi
+  g push -q --force-with-lease="$BRANCH:$before" origin "$BRANCH" 2>/dev/null \
+    || g push -q --force origin "$BRANCH" || log "warn: could not push $BRANCH to origin"
+  log "rebased $BRANCH onto $new"
+}
+
+sign_identity() {
+  if [[ -n "${T3FORK_SIGN_IDENTITY:-}" ]]; then echo "$T3FORK_SIGN_IDENTITY"; return; fi
+  # A stable certificate keeps the designated requirement constant, so Keychain access granted to
+  # one build carries over to the next instead of prompting after every update.
+  security find-identity -v -p codesigning 2>/dev/null \
+    | awk -F'"' '/Apple Development|Developer ID Application/ {print $2; exit}' | grep . || echo "-"
+}
+
+build() {
+  local sha tag version out zip app
+  sha="$(g rev-parse "$BRANCH")"
+  tag="$(base_tag)"
+  version="${tag#v}"
+  ensure_build_worktree
+  log "building $BRANCH @ ${sha:0:10} as $version"
+  git -C "$BUILD_DIR" checkout -q -f --detach "$sha"
+  out="$STATE/out/$version-${sha:0:10}"
+  (
+    set -e
+    cd "$BUILD_DIR"
+    # Public relay/Clerk config the official release bakes in (same values as .env.example).
+    set -a
+    eval "$(grep -E '^T3CODE_(CLERK_PUBLISHABLE_KEY|CLERK_JWT_TEMPLATE|CLERK_CLI_OAUTH_CLIENT_ID|RELAY_URL)=' .env.example || true)"
+    set +a
+    # No T3CODE_DESKTOP_UPDATE_REPOSITORY/GITHUB_REPOSITORY => no app-update.yml => the built-in
+    # updater stays off, so the app never "updates" itself back to the stock upstream build.
+    unset GITHUB_REPOSITORY T3CODE_DESKTOP_UPDATE_REPOSITORY
+    rm -rf "$out"
+    pnpm install --frozen-lockfile --reporter=append-only &&
+      pnpm run dist:desktop:artifact --platform mac --target zip --arch "$(uname -m)" \
+        --build-version "$version" --output-dir "$out"
+  ) || die "build of ${sha:0:10} failed (see $STATE/logs/latest.log)"
+  zip="$(ls "$out"/*.zip | head -1)"
+  rm -rf "$STATE/staged"; mkdir -p "$STATE/staged"
+  ditto -x -k "$zip" "$STATE/staged"
+  app="$STATE/staged/$APP_NAME"
+  [[ -d "$app" ]] || die "build produced no '$APP_NAME'"
+  local ident; ident="$(sign_identity)"
+  log "signing with: $ident"
+  codesign --force --deep --sign "$ident" "$app"
+  codesign --verify --deep --strict "$app"
+  printf '%s %s\n' "$sha" "$version" >"$STATE/staged.meta"
+  echo "$sha" >"$STATE/built-sha"
+  # Keep only the 3 newest build outputs.
+  ls -1dt "$STATE"/out/*/ 2>/dev/null | tail -n +4 | xargs -I{} rm -rf {}
+  log "built and staged ${sha:0:10}"
+}
+
+app_running() {
+  local re; re="$(printf '%s' "$APP_DEST/Contents/MacOS/" | sed 's/[][().*+?^$|\\{}]/\\&/g')"
+  pgrep -f "$re" >/dev/null 2>&1
+}
+
+install_staged() {
+  local restart="${1:-0}" app="$STATE/staged/$APP_NAME" meta
+  [[ -d "$app" ]] || { log "nothing staged to install"; return 0; }
+  meta="$(statefile staged.meta)"
+  if app_running; then
+    if [[ "$restart" != 1 ]]; then
+      log "T3 Code is running; staged build will be installed after it quits"
+      notify "T3 fork ready" "Custom T3 Code ${meta#* } is built. It installs once you quit T3 Code (or run: t3fork install --restart)."
+      return 0
+    fi
+    log "quitting T3 Code"
+    osascript -e "quit app id \"$BUNDLE_ID\"" >/dev/null 2>&1 || true
+    for _ in $(seq 1 60); do app_running || break; sleep 1; done
+    app_running && die "T3 Code did not quit; staged build left in place"
+  fi
+  log "installing to $APP_DEST"
+  rm -rf "$STATE/previous"; mkdir -p "$STATE/previous"
+  [[ -d "$APP_DEST" ]] && mv "$APP_DEST" "$STATE/previous/"
+  mv "$app" "$APP_DEST"
+  echo "$meta" >"$STATE/installed.meta"
+  rm -f "$STATE/staged.meta"
+  log "installed ${meta:0:10} (${meta#* })"
+  notify "T3 Code updated" "Custom build ${meta#* } (${meta:0:10}) installed."
+  [[ "$restart" == 1 ]] && open -b "$BUNDLE_ID" || true
+}
+
+cmd_update() {
+  local restart="${1:-0}" latest rc=0
+  fetch_upstream
+  latest="$(latest_release_tag)" || die "could not determine the latest upstream release"
+  if [[ "$(base_tag)" != "$latest" ]]; then
+    rebase_onto "$latest" || rc=$?
+    if [[ $rc == 1 ]]; then
+      echo "$latest" >"$STATE/conflict"
+      die "rebasing '$BRANCH' onto $latest hit conflicts. Run 't3fork rebase' in $REPO to resolve."
+    fi
+    [[ $rc == 0 ]] && rm -f "$STATE/conflict"
+  fi
+  # Refresh the installed copy of this script from the (possibly rebased) branch.
+  self_install quiet
+  if [[ "$(g rev-parse "$BRANCH")" != "$(statefile built-sha)" ]]; then
+    build
+  fi
+  install_staged "$restart"
+}
+
+cmd_rebase() {
+  fetch_upstream
+  local latest old; latest="$(latest_release_tag)" || die "no upstream release found"; old="$(base_tag)"
+  [[ "$old" == "$latest" ]] && { log "$BRANCH is already on $latest"; return 0; }
+  [[ -z "$(g status --porcelain --untracked-files=no)" ]] || die "commit or stash changes in $REPO first"
+  g switch -q "$BRANCH"
+  log "rebasing $BRANCH: $old -> $latest (resolve conflicts, then 'git rebase --continue' and 't3fork build')"
+  g rebase --onto "$latest" "$old" "$BRANCH"
+  rm -f "$STATE/conflict"
+  g push --force-with-lease origin "$BRANCH" || true
+}
+
+cmd_rollback() {
+  local prev="$STATE/previous/$APP_NAME"
+  [[ -d "$prev" ]] || die "no previous build to roll back to"
+  app_running && die "quit T3 Code first"
+  rm -rf "$STATE/rolled-back"; mkdir -p "$STATE/rolled-back"
+  mv "$APP_DEST" "$STATE/rolled-back/"
+  mv "$prev" "$APP_DEST"
+  log "rolled back; the replaced build is in $STATE/rolled-back"
+}
+
+cmd_status() {
+  local latest base
+  latest="$(gh release view -R "$UPSTREAM_REPO" --json tagName -q .tagName 2>/dev/null || echo '?')"
+  base="$(base_tag 2>/dev/null || echo '?')"
+  echo "upstream latest release : $latest"
+  echo "$BRANCH based on         : $base"
+  echo "$BRANCH head             : $(g rev-parse --short "$BRANCH")"
+  echo "built                   : $(statefile built-sha | cut -c1-10)"
+  echo "installed               : $(statefile installed.meta)"
+  echo "staged (pending install): $([[ -d "$STATE/staged/$APP_NAME" ]] && statefile staged.meta || echo no)"
+  [[ -f "$STATE/conflict" ]] && echo "CONFLICT                : rebasing onto $(statefile conflict) needs manual resolution (t3fork rebase)"
+  echo "launchd agent           : $(launchctl print "gui/$(id -u)/$LABEL" >/dev/null 2>&1 && echo loaded || echo 'not loaded')"
+  echo; echo "Your commits on top of $base:"
+  g log --oneline --no-decorate "$base..$BRANCH" | sed 's/^/  /'
+}
+
+self_install() {
+  local src; src="$(g show "$BRANCH:fork/t3fork" 2>/dev/null)" || return 0
+  local tmp; tmp="$(mktemp "$STATE/bin/.t3fork.XXXX")"
+  printf '%s\n' "$src" >"$tmp"; chmod 755 "$tmp"
+  mv -f "$tmp" "$STATE/bin/t3fork"   # atomic rename; a running copy keeps its old inode
+  mkdir -p "$HOME/.local/bin"; ln -sf "$STATE/bin/t3fork" "$HOME/.local/bin/t3fork"
+  [[ "${1:-}" == quiet ]] || log "installed $STATE/bin/t3fork (symlinked from ~/.local/bin/t3fork)"
+}
+
+cmd_setup() {
+  self_install
+  mkdir -p "$(dirname "$PLIST")"
+  cat >"$PLIST" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>$LABEL</string>
+  <key>ProgramArguments</key>
+  <array><string>$STATE/bin/t3fork</string><string>update</string></array>
+  <key>StartInterval</key><integer>3600</integer>
+  <key>RunAtLoad</key><true/>
+  <key>LowPriorityIO</key><true/>
+  <key>ProcessType</key><string>Background</string>
+  <key>StandardOutPath</key><string>$STATE/logs/launchd.log</string>
+  <key>StandardErrorPath</key><string>$STATE/logs/launchd.log</string>
+</dict>
+</plist>
+EOF
+  launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
+  launchctl bootstrap "gui/$(id -u)" "$PLIST"
+  log "launchd agent $LABEL loaded (runs hourly and at login)"
+}
+
+with_log() {
+  local logf="$STATE/logs/$(date +%Y%m%d-%H%M%S)-$1.log"
+  ln -sf "$logf" "$STATE/logs/latest.log"
+  ls -1t "$STATE"/logs/2*.log 2>/dev/null | tail -n +31 | xargs rm -f 2>/dev/null || true
+  exec > >(tee -a "$logf") 2>&1
+}
+
+restart_flag() { [[ "${1:-}" == "--restart" ]] && echo 1 || echo 0; }
+
+case "${1:-update}" in
+  update)  with_log update;  acquire_lock; cmd_update "$(restart_flag "${2:-}")" ;;
+  build)   with_log build;   acquire_lock; build; install_staged "$(restart_flag "${2:-}")" ;;
+  install) acquire_lock; install_staged "$(restart_flag "${2:-}")" ;;
+  rebase)  acquire_lock; cmd_rebase ;;
+  rollback) acquire_lock; cmd_rollback ;;
+  status)  cmd_status ;;
+  setup)   cmd_setup ;;
+  uninstall-agent) launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true; rm -f "$PLIST"; log "agent removed" ;;
+  *) sed -n '2,14p' "$0"; exit 1 ;;
+esac
